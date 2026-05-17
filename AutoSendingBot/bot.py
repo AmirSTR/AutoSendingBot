@@ -1,5 +1,7 @@
 import asyncio
+import warnings
 import logging
+from telegram.warnings import PTBUserWarning
 import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -628,6 +630,7 @@ def main():
     cancel_filter = filters.Regex('^❌ Отмена$')
     text_no_cmd = filters.TEXT & ~filters.COMMAND & ~cancel_filter
 
+    warnings.filterwarnings('ignore', message="If 'per_message=False'", category=PTBUserWarning)
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler('add', add_start),
