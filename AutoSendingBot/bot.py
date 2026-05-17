@@ -36,8 +36,7 @@ WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
+vk = None  # инициализируется в main() после проверки токена
 
 tg_app = None
 user_chat_id = None  # устанавливается при первом /start
@@ -81,12 +80,13 @@ def schedule_job(task: dict):
 
     async def job_func():
         ok = await send_vk_message(task['peer_id'], task['message'])
-        if user_chat_id and tg_app:
+        notify_id = user_chat_id or (ALLOWED_USER_ID if ALLOWED_USER_ID else None)
+        if notify_id and tg_app:
             icon = "✅" if ok else "❌"
             verb = "отправлено в ВК" if ok else "ошибка отправки в ВК"
             try:
                 await tg_app.bot.send_message(
-                    chat_id=user_chat_id,
+                    chat_id=notify_id,
                     text=(
                         f"{icon} Задача #{task['id']} — {verb}\n"
                         f"📨 {task['message'][:60]}\n"
@@ -481,6 +481,9 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
     await query.answer()
     task_id = int(query.data.split(':')[1])
     task = db.get_task(task_id)
@@ -497,11 +500,21 @@ async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
     await query.answer()
     task_id = int(query.data.split(':')[1])
     task = db.get_task(task_id)
     if not task:
         await query.edit_message_text("❌ Задача не найдена.")
+        return
+    if (task['repeat_type'] == 'once'
+            and datetime.fromisoformat(task['next_run']) < _now_msk()):
+        await query.edit_message_text(
+            f"⚠️ Задача #{task_id} не может быть возобновлена — время отправки уже прошло.\n"
+            "Удали задачу и создай новую."
+        )
         return
     db.set_paused(task_id, False)
     job_id = f"task_{task_id}"
@@ -515,6 +528,9 @@ async def task_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
     await query.answer()
     task_id = int(query.data.split(':')[1])
     task = db.get_task(task_id)
@@ -535,6 +551,9 @@ async def task_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_del_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
     await query.answer()
     task_id = int(query.data.split(':')[1])
     db.delete_task(task_id)
@@ -546,6 +565,9 @@ async def task_del_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_del_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
     await query.answer()
     task_id = int(query.data.split(':')[1])
     task = db.get_task(task_id)
@@ -598,7 +620,9 @@ def main():
     if not VK_TOKEN:
         raise RuntimeError("Переменная окружения VK_TOKEN не задана")
 
-    global tg_app
+    global tg_app, vk
+    vk_session = vk_api.VkApi(token=VK_TOKEN)
+    vk = vk_session.get_api()
     tg_app = Application.builder().token(TG_TOKEN).build()
 
     cancel_filter = filters.Regex('^❌ Отмена$')
@@ -663,6 +687,16 @@ def main():
                         db.delete_task(task['id'])
                         logger.warning(f"Пропущена задача #{task['id']} — время уже прошло")
                     else:
+                        if task['repeat_type'] == 'interval':
+                            next_run = datetime.fromisoformat(task['next_run'])
+                            now = _now_msk()
+                            if next_run < now:
+                                minutes = int(task['repeat_value'])
+                                elapsed = (now - next_run).total_seconds() / 60
+                                periods = int(elapsed / minutes) + 1
+                                next_run = next_run + timedelta(minutes=minutes * periods)
+                                db.update_next_run(task['id'], next_run.isoformat())
+                                task = {**task, 'next_run': next_run.isoformat()}
                         schedule_job(task)
                 except Exception as e:
                     logger.warning(f"Не удалось загрузить задачу #{task['id']}: {e}")
