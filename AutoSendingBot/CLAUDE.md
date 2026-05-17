@@ -139,6 +139,14 @@ WAIT_MESSAGE → WAIT_PEER_ID → WAIT_DATETIME → WAIT_REPEAT_CHOICE
 
 ---
 
+## Git Workflow
+
+- Все изменения коммить напрямую в текущую ветку (`main` / `master`)
+- Не создавай новые ветки и pull requests — применяй изменения сразу
+- Создавай ветку только если пользователь явно попросил об этом
+
+---
+
 ## Деплой
 
 - **Webhook** (production): задать `WEBHOOK_URL` → `tg_app.run_webhook(listen="0.0.0.0", port=PORT, ...)`
