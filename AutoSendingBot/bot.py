@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import vk_api
 from database import Database
-from config import TG_TOKEN, VK_TOKEN, ALLOWED_USER_ID, WEBHOOK_URL, PORT
+from config import TG_TOKEN, VK_TOKEN, DATABASE_URL, ALLOWED_USER_ID, WEBHOOK_URL, PORT
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -621,6 +621,8 @@ def main():
         raise RuntimeError("Переменная окружения TG_TOKEN не задана")
     if not VK_TOKEN:
         raise RuntimeError("Переменная окружения VK_TOKEN не задана")
+    if not DATABASE_URL:
+        raise RuntimeError("Переменная окружения DATABASE_URL не задана")
 
     global tg_app, vk
     vk_session = vk_api.VkApi(token=VK_TOKEN)
