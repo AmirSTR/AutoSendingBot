@@ -272,16 +272,90 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def _get_vk_chat_keyboard() -> InlineKeyboardMarkup | None:
+    """Подгружает беседы из VK и возвращает inline-клавиатуру с кнопками выбора."""
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: vk.messages.getConversations(count=20, filter='all', extended=1)
+        )
+        profiles = {p['id']: p for p in result.get('profiles', [])}
+        groups = {g['id']: g for g in result.get('groups', [])}
+        buttons = []
+        for item in result.get('items', []):
+            conv = item['conversation']
+            peer = conv['peer']
+            peer_id = peer['id']
+            peer_type = peer['type']
+            if peer_type == 'chat':
+                title = conv.get('chat_settings', {}).get('title', f'Беседа {peer["local_id"]}')
+                icon = '👥'
+            elif peer_type == 'user':
+                u = profiles.get(peer_id, {})
+                title = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or f'id{peer_id}'
+                icon = '👤'
+            elif peer_type == 'group':
+                g = groups.get(abs(peer_id), {})
+                title = g.get('name', f'Группа {peer_id}')
+                icon = '📢'
+            else:
+                title, icon = f'peer_id {peer_id}', '💬'
+            buttons.append([InlineKeyboardButton(
+                f"{icon} {title[:40]}", callback_data=f"select_chat:{peer_id}"
+            )])
+        if not buttons:
+            return None
+        buttons.append([InlineKeyboardButton("✏️ Ввести peer_id вручную", callback_data="peer_manual")])
+        return InlineKeyboardMarkup(buttons)
+    except Exception as e:
+        logger.error(f"Ошибка получения чатов VK: {e}")
+        return None
+
+
 async def add_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['message'] = update.message.text
-    await update.message.reply_text(
+    kb = await _get_vk_chat_keyboard()
+    if kb:
+        await update.message.reply_text("📬 Выбери чат для отправки:", reply_markup=kb)
+    else:
+        await update.message.reply_text(
+            "📬 Введи peer_id чата ВК\n\n"
+            "• Беседа: число из ссылки + 2 000 000 000\n"
+            "  /convo/4 → peer_id = 2000000004\n"
+            "• Личка: ID пользователя (например: 123456)\n"
+            "• Группа: −ID группы (например: −987654)\n\n"
+            "Введи peer_id:",
+            reply_markup=CANCEL_KB,
+        )
+    return WAIT_PEER_ID
+
+
+async def select_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['peer_id'] = int(query.data.split(':')[1])
+    await query.edit_message_text(
+        f"✅ Чат выбран (peer_id: {context.user_data['peer_id']})\n\n"
+        "🕐 Введи дату и время первой отправки:\n\n"
+        "• сегодня 14:30\n"
+        "• завтра 09:00\n"
+        "• 25.04.2026 14:30\n\n"
+        "Время московское (МСК)."
+    )
+    return WAIT_DATETIME
+
+
+async def peer_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
         "📬 Введи peer_id чата ВК\n\n"
         "• Беседа: число из ссылки + 2 000 000 000\n"
         "  /convo/4 → peer_id = 2000000004\n"
         "• Личка: ID пользователя (например: 123456)\n"
         "• Группа: −ID группы (например: −987654)\n\n"
-        "Введи peer_id:",
-        reply_markup=CANCEL_KB,
+        "Введи peer_id:"
     )
     return WAIT_PEER_ID
 
@@ -640,7 +714,11 @@ def main():
         ],
         states={
             WAIT_MESSAGE:      [MessageHandler(text_no_cmd, add_message)],
-            WAIT_PEER_ID:      [MessageHandler(text_no_cmd, add_peer_id)],
+            WAIT_PEER_ID: [
+                CallbackQueryHandler(select_chat_callback, pattern='^select_chat:'),
+                CallbackQueryHandler(peer_manual_callback,  pattern='^peer_manual$'),
+                MessageHandler(text_no_cmd, add_peer_id),
+            ],
             WAIT_DATETIME:     [MessageHandler(text_no_cmd, add_datetime)],
             WAIT_REPEAT_CHOICE: [
                 CallbackQueryHandler(add_repeat_choice, pattern='^repeat:'),
