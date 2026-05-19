@@ -72,3 +72,11 @@ class Database:
     def update_next_run(self, task_id: int, next_run: str):
         with self._cursor() as cur:
             cur.execute('UPDATE tasks SET next_run = %s WHERE id = %s', (next_run, task_id))
+
+    def update_message(self, task_id: int, message: str):
+        with self._cursor() as cur:
+            cur.execute('UPDATE tasks SET message = %s WHERE id = %s', (message, task_id))
+
+    def update_peer_id(self, task_id: int, peer_id: int):
+        with self._cursor() as cur:
+            cur.execute('UPDATE tasks SET peer_id = %s WHERE id = %s', (peer_id, task_id))

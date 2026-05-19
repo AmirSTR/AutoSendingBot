@@ -34,6 +34,7 @@ def _now_msk() -> datetime:
 
 
 WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_DAYS_SELECTION = range(6)
+EDIT_CHOICE, EDIT_MESSAGE, EDIT_PEER_ID, EDIT_DATETIME = range(6, 10)
 
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -97,7 +98,7 @@ def schedule_job(task: dict):
                 )
             except Exception as e:
                 logger.error(f"Ошибка уведомления: {e}")
-        if task['repeat_type'] == 'once':
+        if task['repeat_type'] == 'once' and ok:
             db.delete_task(task['id'])
         else:
             # Обновляем next_run в БД чтобы карточка показывала актуальное время
@@ -225,7 +226,8 @@ def _task_card_kb(t: dict) -> InlineKeyboardMarkup:
     else:
         toggle = InlineKeyboardButton("⏸ Пауза", callback_data=f"task_pause:{t['id']}")
     delete = InlineKeyboardButton("🗑 Удалить", callback_data=f"task_del_ask:{t['id']}")
-    return InlineKeyboardMarkup([[toggle, delete]])
+    edit   = InlineKeyboardButton("✏️ Изменить", callback_data=f"task_edit:{t['id']}")
+    return InlineKeyboardMarkup([[toggle, delete], [edit]])
 
 
 def _task_confirmation(task_id, data, repeat_type, repeat_value) -> str:
@@ -533,6 +535,166 @@ async def _save_task_from_message(update, context, repeat_type, repeat_value):
     )
 
 
+# ── edit task conversation ────────────────────────────────────────────────────
+
+def _apply_edit_and_reschedule(task_id: int) -> dict | None:
+    job_id = f"task_{task_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+    task = db.get_task(task_id)
+    if task and not task['paused']:
+        schedule_job(task)
+    return task
+
+
+async def task_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not check_auth(query.from_user.id):
+        await query.answer("⛔ Нет доступа.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    task_id = int(query.data.split(':')[1])
+    task = db.get_task(task_id)
+    if not task:
+        await query.edit_message_text("❌ Задача не найдена.")
+        return ConversationHandler.END
+    context.user_data['edit_task_id'] = task_id
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📨 Текст сообщения", callback_data="edit_field:message")],
+        [InlineKeyboardButton("📬 Чат отправки",    callback_data="edit_field:peer")],
+        [InlineKeyboardButton("🕐 Время отправки",  callback_data="edit_field:datetime")],
+        [InlineKeyboardButton("❌ Отмена",           callback_data="edit_cancel")],
+    ])
+    await query.edit_message_text(
+        f"✏️ Редактирование задачи #{task_id}\n"
+        f"📨 {task['message'][:60]}\n\n"
+        "Что изменить?",
+        reply_markup=kb,
+    )
+    return EDIT_CHOICE
+
+
+async def task_edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(':')[1]
+    task_id = context.user_data.get('edit_task_id')
+    task = db.get_task(task_id)
+
+    if field == 'message':
+        await query.edit_message_text("📨 Введи новый текст сообщения:")
+        return EDIT_MESSAGE
+
+    if field == 'peer':
+        kb = await _get_vk_chat_keyboard()
+        if kb:
+            await query.edit_message_text("📬 Выбери новый чат для отправки:", reply_markup=kb)
+        else:
+            await query.edit_message_text("📬 Введи новый peer_id:")
+        return EDIT_PEER_ID
+
+    if field == 'datetime':
+        if task and task['repeat_type'] in ('daily', 'weekly', 'weekly_days'):
+            await query.edit_message_text(
+                "⚠️ Для задач с повтором по дням изменить время нельзя здесь.\n"
+                "Удали задачу и создай заново с нужным временем."
+            )
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "🕐 Введи новую дату и время:\n\n"
+            "• сегодня 14:30\n"
+            "• завтра 09:00\n"
+            "• 25.04.2026 14:30\n\n"
+            "Время московское (МСК)."
+        )
+        return EDIT_DATETIME
+
+    return ConversationHandler.END
+
+
+async def edit_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = context.user_data.pop('edit_task_id', None)
+    task = db.get_task(task_id) if task_id else None
+    if task:
+        await query.edit_message_text(_task_card_text(task), reply_markup=_task_card_kb(task))
+    else:
+        await query.edit_message_text("❌ Задача не найдена.")
+    return ConversationHandler.END
+
+
+async def edit_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_id = context.user_data.pop('edit_task_id', None)
+    db.update_message(task_id, update.message.text)
+    task = _apply_edit_and_reschedule(task_id)
+    await update.message.reply_text(
+        f"✅ Текст обновлён!\n\n{_task_card_text(task)}",
+        reply_markup=_task_card_kb(task),
+    )
+    return ConversationHandler.END
+
+
+async def edit_peer_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = context.user_data.pop('edit_task_id', None)
+    peer_id = int(query.data.split(':')[1])
+    db.update_peer_id(task_id, peer_id)
+    task = _apply_edit_and_reschedule(task_id)
+    await query.edit_message_text(
+        f"✅ Чат обновлён!\n\n{_task_card_text(task)}",
+        reply_markup=_task_card_kb(task),
+    )
+    return ConversationHandler.END
+
+
+async def edit_peer_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📬 Введи новый peer_id:")
+    return EDIT_PEER_ID
+
+
+async def edit_peer_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        peer_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ peer_id должен быть числом. Попробуй ещё раз:")
+        return EDIT_PEER_ID
+    task_id = context.user_data.pop('edit_task_id', None)
+    db.update_peer_id(task_id, peer_id)
+    task = _apply_edit_and_reschedule(task_id)
+    await update.message.reply_text(
+        f"✅ Чат обновлён!\n\n{_task_card_text(task)}",
+        reply_markup=_task_card_kb(task),
+    )
+    return ConversationHandler.END
+
+
+async def edit_datetime_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dt = parse_datetime(update.message.text)
+    if dt is None:
+        await update.message.reply_text(
+            "❌ Не понял дату. Попробуй:\n"
+            "• сегодня 14:30\n"
+            "• завтра 09:00\n"
+            "• 25.04.2026 14:30"
+        )
+        return EDIT_DATETIME
+    if dt < _now_msk():
+        await update.message.reply_text("❌ Это время уже прошло. Введи будущую дату и время:")
+        return EDIT_DATETIME
+    task_id = context.user_data.pop('edit_task_id', None)
+    db.update_next_run(task_id, dt.isoformat())
+    task = _apply_edit_and_reschedule(task_id)
+    await update.message.reply_text(
+        f"✅ Время обновлено!\n\n{_task_card_text(task)}",
+        reply_markup=_task_card_kb(task),
+    )
+    return ConversationHandler.END
+
+
 # ── /list ─────────────────────────────────────────────────────────────────────
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,8 +900,33 @@ def main():
         conversation_timeout=300,
     )
 
+    cancel_edit = MessageHandler(cancel_filter, edit_cancel_callback)
+    edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(task_edit_start, pattern='^task_edit:')],
+        states={
+            EDIT_CHOICE: [
+                CallbackQueryHandler(task_edit_choice,    pattern='^edit_field:'),
+                CallbackQueryHandler(edit_cancel_callback, pattern='^edit_cancel$'),
+            ],
+            EDIT_MESSAGE: [MessageHandler(text_no_cmd, edit_message_handler)],
+            EDIT_PEER_ID: [
+                CallbackQueryHandler(edit_peer_select_callback, pattern='^select_chat:'),
+                CallbackQueryHandler(edit_peer_manual_callback,  pattern='^peer_manual$'),
+                MessageHandler(text_no_cmd, edit_peer_text_handler),
+            ],
+            EDIT_DATETIME: [MessageHandler(text_no_cmd, edit_datetime_handler)],
+        },
+        fallbacks=[
+            CommandHandler('start', start),
+            cancel_edit,
+        ],
+        per_message=False,
+        conversation_timeout=300,
+    )
+
     tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(add_conv)
+    tg_app.add_handler(edit_conv)
     tg_app.add_handler(CommandHandler('list',   list_tasks))
     tg_app.add_handler(CommandHandler('delete', delete_task))
     tg_app.add_handler(CommandHandler('pause',  pause_task))
