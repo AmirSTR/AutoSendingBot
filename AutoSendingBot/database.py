@@ -53,6 +53,17 @@ class Database:
         with self._conn() as conn:
             conn.execute('DELETE FROM tasks WHERE id=?', (task_id,))
 
+    def update_task(self, task_id: int, message: str, peer_id: int,
+                    next_run: str, repeat_type: str, repeat_value: str) -> bool:
+        """Update editable fields without changing the ID or paused state."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                '''UPDATE tasks SET message=?, peer_id=?, next_run=?,
+                   repeat_type=?, repeat_value=? WHERE id=?''',
+                (message, peer_id, next_run, repeat_type, repeat_value, task_id),
+            )
+            return cur.rowcount == 1
+
     def set_paused(self, task_id: int, paused: bool):
         with self._conn() as conn:
             conn.execute('UPDATE tasks SET paused=? WHERE id=?', (int(paused), task_id))

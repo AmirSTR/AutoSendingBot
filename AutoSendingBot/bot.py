@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+from functools import wraps
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import (
@@ -9,11 +10,10 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, filters, ContextTypes
+    CallbackQueryHandler, ConversationHandler, TypeHandler, filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from scheduling import build_trigger, next_run_iso
 import vk_api
 from database import Database
 from config import TG_TOKEN, VK_TOKEN, ALLOWED_USER_ID, WEBHOOK_URL, PORT
@@ -31,7 +31,7 @@ def _now_msk() -> datetime:
     return datetime.now(_MSK).replace(tzinfo=None)
 
 
-WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_DAYS_SELECTION = range(6)
+WAIT_MESSAGE, WAIT_PEER_ID, WAIT_DATETIME, WAIT_REPEAT_CHOICE, WAIT_REPEAT_HOURS, WAIT_DAYS_SELECTION, WAIT_MONTH_DAYS, EDIT_CHOICE, EDIT_MESSAGE, EDIT_PEER = range(10)
 
 db = Database()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -58,6 +58,17 @@ def check_auth(user_id: int) -> bool:
     return ALLOWED_USER_ID == 0 or user_id == ALLOWED_USER_ID
 
 
+def authorized(handler):
+    @wraps(handler)
+    async def wrapped(update, context):
+        if not check_auth(update.effective_user.id):
+            if update.callback_query:
+                await update.callback_query.answer("Нет доступа", show_alert=True)
+            return ConversationHandler.END
+        return await handler(update, context)
+    return wrapped
+
+
 async def send_vk_message(peer_id: int, message: str) -> bool:
     try:
         loop = asyncio.get_running_loop()
@@ -80,7 +91,10 @@ def schedule_job(task: dict):
     job_id = f"task_{task['id']}"
 
     async def job_func():
-        ok = await send_vk_message(task['peer_id'], task['message'])
+        current = db.get_task(task['id'])
+        if not current or current['paused']:
+            return
+        ok = await send_vk_message(current['peer_id'], current['message'])
         if user_chat_id and tg_app:
             icon = "✅" if ok else "❌"
             verb = "отправлено в ВК" if ok else "ошибка отправки в ВК"
@@ -89,12 +103,16 @@ def schedule_job(task: dict):
                     chat_id=user_chat_id,
                     text=(
                         f"{icon} Задача #{task['id']} — {verb}\n"
-                        f"📨 {task['message'][:60]}\n"
-                        f"📬 peer_id: {task['peer_id']}"
+                        f"📨 {current['message'][:60]}\n"
+                        f"📬 peer_id: {current['peer_id']}"
                     ),
                 )
             except Exception as e:
                 logger.error(f"Ошибка уведомления: {e}")
+        replacement = scheduler.get_job(job_id)
+        if replacement and replacement.func is not job_func:
+            # An edit replaced this job while VK was responding.
+            return
         if task['repeat_type'] == 'once':
             db.delete_task(task['id'])
         else:
@@ -105,41 +123,13 @@ def schedule_job(task: dict):
                 msk_naive = job.next_run_time.astimezone(_MSK).replace(tzinfo=None)
                 db.update_next_run(task['id'], msk_naive.isoformat())
 
-    if task['repeat_type'] == 'once':
-        run_date = datetime.fromisoformat(task['next_run'])
-        scheduler.add_job(job_func, 'date', run_date=run_date, id=job_id, replace_existing=True)
-
-    elif task['repeat_type'] == 'interval':
-        minutes = int(task['repeat_value'])
-        scheduler.add_job(
-            job_func, IntervalTrigger(minutes=minutes),
-            id=job_id, replace_existing=True,
-            next_run_time=datetime.fromisoformat(task['next_run']),
-        )
-
-    elif task['repeat_type'] == 'daily':
-        hour, minute = task['repeat_value'].split(':')
-        scheduler.add_job(
-            job_func, CronTrigger(hour=int(hour), minute=int(minute), timezone="Europe/Moscow"),
-            id=job_id, replace_existing=True,
-        )
-
-    elif task['repeat_type'] == 'weekly':
-        day, hour, minute = task['repeat_value'].split(':')
-        scheduler.add_job(
-            job_func, CronTrigger(
-                day_of_week=int(day), hour=int(hour), minute=int(minute), timezone="Europe/Moscow"
-            ),
-            id=job_id, replace_existing=True,
-        )
-
-    elif task['repeat_type'] == 'weekly_days':
-        parts = task['repeat_value'].split(':')
-        days_str, hour, minute = parts[0], int(parts[1]), int(parts[2])
-        scheduler.add_job(
-            job_func, CronTrigger(day_of_week=days_str, hour=hour, minute=minute, timezone="Europe/Moscow"),
-            id=job_id, replace_existing=True,
-        )
+    trigger = build_trigger(task)
+    next_run = next_run_iso(task)
+    db.update_next_run(task['id'], next_run)
+    scheduler.add_job(
+        job_func, trigger, id=job_id, replace_existing=True,
+        next_run_time=None if task['paused'] else datetime.fromisoformat(next_run).replace(tzinfo=_MSK),
+    )
 
 
 def repeat_label(repeat_type, repeat_value):
@@ -153,6 +143,9 @@ def repeat_label(repeat_type, repeat_value):
         days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
         parts = repeat_value.split(':')
         return f'Каждую неделю {days[int(parts[0])]} в {parts[1]}:{parts[2]}'
+    if repeat_type == 'monthly_days':
+        days, hour, minute = repeat_value.split(':')
+        return f"Каждый месяц по числам {days.replace(',', ', ')} в {hour}:{minute}"
     if repeat_type == 'weekly_days':
         day_names = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
         parts = repeat_value.split(':')
@@ -223,21 +216,13 @@ def _task_card_kb(t: dict) -> InlineKeyboardMarkup:
     else:
         toggle = InlineKeyboardButton("⏸ Пауза", callback_data=f"task_pause:{t['id']}")
     delete = InlineKeyboardButton("🗑 Удалить", callback_data=f"task_del_ask:{t['id']}")
-    return InlineKeyboardMarkup([[toggle, delete]])
-
-
-def _task_confirmation(task_id, data, repeat_type, repeat_value) -> str:
-    return (
-        f"✅ Задача #{task_id} создана!\n\n"
-        f"📨 Сообщение: {data['message'][:50]}\n"
-        f"📬 peer_id: {data['peer_id']}\n"
-        f"🕐 Первая отправка: {_fmt_dt(data['next_run'])}\n"
-        f"🔄 Повтор: {repeat_label(repeat_type, repeat_value)}"
-    )
+    edit = InlineKeyboardButton("✏️ Редактировать", callback_data=f"task_edit:{t['id']}")
+    return InlineKeyboardMarkup([[edit], [toggle, delete]])
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
+@authorized
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global user_chat_id
     if not check_auth(update.effective_user.id):
@@ -249,10 +234,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Используй кнопки ниже для управления задачами.",
         reply_markup=MAIN_KB,
     )
+    return ConversationHandler.END
 
 
 # ── /add conversation ─────────────────────────────────────────────────────────
 
+@authorized
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
         return ConversationHandler.END
@@ -264,12 +251,14 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_MESSAGE
 
 
+@authorized
 async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Создание задачи отменено.", reply_markup=MAIN_KB)
+    await update.message.reply_text("❌ Изменения отменены.", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
 
+@authorized
 async def add_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['message'] = update.message.text
     await update.message.reply_text(
@@ -284,6 +273,7 @@ async def add_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_PEER_ID
 
 
+@authorized
 async def add_peer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         context.user_data['peer_id'] = int(update.message.text.strip())
@@ -302,6 +292,7 @@ async def add_peer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_DATETIME
 
 
+@authorized
 async def add_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dt = parse_datetime(update.message.text)
     if dt is None:
@@ -326,11 +317,13 @@ async def add_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📅 Каждый день в это время",  callback_data="repeat:daily")],
         [InlineKeyboardButton("📆 Раз в неделю",             callback_data="repeat:weekly")],
         [InlineKeyboardButton("🗓 Выбрать дни недели",       callback_data="repeat:weekly_days")],
+        [InlineKeyboardButton("📆 Числа каждого месяца", callback_data="repeat:monthly_days")],
     ]
     await update.message.reply_text("🔄 Выбери режим повтора:", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAIT_REPEAT_CHOICE
 
 
+@authorized
 async def add_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -371,11 +364,21 @@ async def add_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAIT_DAYS_SELECTION
 
+    if repeat_type == 'monthly_days':
+        context.user_data['selected_month_days'] = set()
+        await query.edit_message_text(
+            "📆 Выбери числа каждого месяца, затем нажми «Готово».\n"
+            "Если числа нет в месяце (например, 31 февраля), отправка пропускается.",
+            reply_markup=_month_days_keyboard(set()),
+        )
+        return WAIT_MONTH_DAYS
+
     logger.error(f"Неизвестный repeat_type: {repeat_type}")
     await query.edit_message_text("❌ Что-то пошло не так. Начни создание задачи заново.")
     return ConversationHandler.END
 
 
+@authorized
 async def add_repeat_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         minutes = int(update.message.text.strip())
@@ -388,6 +391,7 @@ async def add_repeat_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+@authorized
 async def add_weekday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -397,6 +401,7 @@ async def add_weekday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@authorized
 async def toggle_day_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     day = int(query.data.split(':')[1])
@@ -410,6 +415,7 @@ async def toggle_day_selection(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAIT_DAYS_SELECTION
 
 
+@authorized
 async def days_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     selected: set = context.user_data.get('selected_days', set())
@@ -424,41 +430,186 @@ async def days_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def _save_task_from_query(query, context, repeat_type, repeat_value):
+def _persist_task(context, repeat_type, repeat_value):
     data = context.user_data
-    task_id = db.add_task(
-        message=data['message'],
-        peer_id=data['peer_id'],
-        next_run=data['next_run'],
-        repeat_type=repeat_type,
-        repeat_value=repeat_value,
-    )
-    schedule_job(db.get_task(task_id))
+    task_id = data.get('editing_task_id')
+    existing = db.get_task(task_id) if task_id is not None else None
+    if task_id is not None and existing is None:
+        return None
+    candidate = dict(message=data['message'], peer_id=data['peer_id'],
+                     next_run=data['next_run'], repeat_type=repeat_type,
+                     repeat_value=repeat_value)
+    candidate['next_run'] = next_run_iso(candidate)
+    if existing is None:
+        task_id = db.add_task(**candidate)
+    elif not db.update_task(task_id, **candidate):
+        return None
+    task = db.get_task(task_id)
+    schedule_job(task)
+    return db.get_task(task_id)
+
+
+async def _save_task_from_query(query, context, repeat_type, repeat_value):
+    editing = 'editing_task_id' in context.user_data
+    task = _persist_task(context, repeat_type, repeat_value)
+    context.user_data.clear()
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(
-        _task_confirmation(task_id, data, repeat_type, repeat_value),
-        reply_markup=MAIN_KB,
-    )
+    if task is None:
+        await query.message.reply_text("❌ Задача уже удалена. Изменения не сохранены.", reply_markup=MAIN_KB)
+        return
+    verb = 'обновлена' if editing else 'создана'
+    await query.message.reply_text(f"✅ Задача #{task['id']} {verb}!", reply_markup=MAIN_KB)
+    await query.message.reply_text(_task_card_text(task), reply_markup=_task_card_kb(task))
 
 
 async def _save_task_from_message(update, context, repeat_type, repeat_value):
+    editing = 'editing_task_id' in context.user_data
+    task = _persist_task(context, repeat_type, repeat_value)
+    context.user_data.clear()
+    if task is None:
+        await update.message.reply_text("❌ Задача уже удалена. Изменения не сохранены.", reply_markup=MAIN_KB)
+        return
+    verb = 'обновлена' if editing else 'создана'
+    await update.message.reply_text(f"✅ Задача #{task['id']} {verb}!", reply_markup=MAIN_KB)
+    await update.message.reply_text(_task_card_text(task), reply_markup=_task_card_kb(task))
+
+
+def _month_days_keyboard(selected):
+    buttons = [InlineKeyboardButton(
+        f"{'✅ ' if day in selected else ''}{day}", callback_data=f"month_day:{day}"
+    ) for day in range(1, 32)]
+    rows = [buttons[i:i + 7] for i in range(0, len(buttons), 7)]
+    return InlineKeyboardMarkup(rows + [[InlineKeyboardButton("✅ Готово", callback_data="month_done")]])
+
+
+@authorized
+async def toggle_month_day(update, context):
+    query = update.callback_query
+    day = int(query.data.split(':')[1])
+    if not 1 <= day <= 31:
+        await query.answer("Некорректное число", show_alert=True)
+        return WAIT_MONTH_DAYS
+    selected = context.user_data.setdefault('selected_month_days', set())
+    selected.symmetric_difference_update({day})
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=_month_days_keyboard(selected))
+    return WAIT_MONTH_DAYS
+
+
+@authorized
+async def month_days_done(update, context):
+    query = update.callback_query
+    days = context.user_data.get('selected_month_days', set())
+    if not days:
+        await query.answer("⚠️ Выбери хотя бы одно число!", show_alert=True)
+        return WAIT_MONTH_DAYS
+    await query.answer()
+    dt = datetime.fromisoformat(context.user_data['next_run'])
+    value = ','.join(str(day) for day in sorted(days)) + f":{dt.hour:02d}:{dt.minute:02d}"
+    await _save_task_from_query(query, context, 'monthly_days', value)
+    return ConversationHandler.END
+
+
+@authorized
+async def edit_start(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.split(':')[1])
+    task = db.get_task(task_id)
+    if task is None:
+        await query.message.reply_text("❌ Задача не найдена.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data.update(task)
+    context.user_data['editing_task_id'] = task_id
+    await query.message.reply_text(
+        f"✏️ Редактирование задачи #{task_id}. Выбери, что изменить.\n"
+        "До сохранения задача работает по прежним настройкам.",
+        reply_markup=CANCEL_KB,
+    )
+    await query.message.reply_text("Что изменить?", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Текст", callback_data="edit_field:message")],
+        [InlineKeyboardButton("📬 Получателя", callback_data="edit_field:peer")],
+        [InlineKeyboardButton("🗓 Расписание", callback_data="edit_field:schedule")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")],
+    ]))
+    return EDIT_CHOICE
+
+
+@authorized
+async def edit_field(update, context):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(':')[1]
+    if field == 'message':
+        await query.edit_message_text("📝 Введи новый текст сообщения:")
+        return EDIT_MESSAGE
+    if field == 'peer':
+        await query.edit_message_text("📬 Введи новый peer_id получателя ВК:")
+        return EDIT_PEER
+    await query.edit_message_text(
+        "🕐 Введи дату и время начала нового расписания (МСК):\n"
+        "• сегодня 14:30\n• завтра 09:00\n• 25.12.2026 14:30\n\n"
+        "Затем можно выбрать дни недели или числа месяца."
+    )
+    return WAIT_DATETIME
+
+
+@authorized
+async def edit_cancel(update, context):
+    await update.callback_query.answer()
+    context.user_data.clear()
+    await update.callback_query.edit_message_text("❌ Изменения отменены.")
+    await update.effective_message.reply_text("Меню", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+
+@authorized
+async def edit_value(update, context):
     data = context.user_data
-    task_id = db.add_task(
-        message=data['message'],
-        peer_id=data['peer_id'],
-        next_run=data['next_run'],
-        repeat_type=repeat_type,
-        repeat_value=repeat_value,
+    task = db.get_task(data['editing_task_id'])
+    if task is None:
+        data.clear()
+        await update.message.reply_text("❌ Задача уже удалена.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+    if data.get('edit_value_kind') == 'peer':
+        try:
+            task['peer_id'] = int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ peer_id должен быть числом. Попробуй ещё раз:")
+            return EDIT_PEER
+    else:
+        task['message'] = update.message.text
+    # Read the current row so editing text cannot restore an obsolete next_run or pause state.
+    data.update(task)
+    await _save_task_from_message(update, context, task['repeat_type'], task['repeat_value'])
+    return ConversationHandler.END
+
+
+@authorized
+async def edit_message(update, context):
+    context.user_data['edit_value_kind'] = 'message'
+    return await edit_value(update, context)
+
+
+@authorized
+async def edit_peer(update, context):
+    context.user_data['edit_value_kind'] = 'peer'
+    return await edit_value(update, context)
+
+
+@authorized
+async def conversation_timeout(update, context):
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "⌛ Время ожидания истекло. Несохранённые изменения отменены.", reply_markup=MAIN_KB,
     )
-    schedule_job(db.get_task(task_id))
-    await update.message.reply_text(
-        _task_confirmation(task_id, data, repeat_type, repeat_value),
-        reply_markup=MAIN_KB,
-    )
+    return ConversationHandler.END
 
 
 # ── /list ─────────────────────────────────────────────────────────────────────
 
+@authorized
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
         return
@@ -479,6 +630,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── task card inline actions ──────────────────────────────────────────────────
 
+@authorized
 async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -495,6 +647,7 @@ async def task_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(_task_card_text(updated), reply_markup=_task_card_kb(updated))
 
 
+@authorized
 async def task_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -503,16 +656,16 @@ async def task_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task:
         await query.edit_message_text("❌ Задача не найдена.")
         return
+    if task['repeat_type'] == 'once' and datetime.fromisoformat(task['next_run']) < _now_msk():
+        await query.message.reply_text("⚠️ Время задачи прошло. Измени расписание перед возобновлением.")
+        return
     db.set_paused(task_id, False)
-    job_id = f"task_{task_id}"
-    if scheduler.get_job(job_id):
-        scheduler.resume_job(job_id)
-    else:
-        schedule_job(task)
-    updated = {**task, 'paused': 0}
+    schedule_job(db.get_task(task_id))
+    updated = db.get_task(task_id)
     await query.edit_message_text(_task_card_text(updated), reply_markup=_task_card_kb(updated))
 
 
+@authorized
 async def task_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -533,6 +686,7 @@ async def task_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@authorized
 async def task_del_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -544,6 +698,7 @@ async def task_del_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"🗑 Задача #{task_id} удалена.")
 
 
+@authorized
 async def task_del_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -557,6 +712,7 @@ async def task_del_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /delete /pause /resume (keyboard-button entry points) ────────────────────
 
+@authorized
 async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
         return
@@ -568,6 +724,7 @@ async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выбери задачу для удаления:", reply_markup=InlineKeyboardMarkup(kb))
 
 
+@authorized
 async def pause_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
         return
@@ -579,6 +736,7 @@ async def pause_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выбери задачу для паузы:", reply_markup=InlineKeyboardMarkup(kb))
 
 
+@authorized
 async def resume_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update.effective_user.id):
         return
@@ -606,10 +764,19 @@ def main():
 
     add_conv = ConversationHandler(
         entry_points=[
+            CallbackQueryHandler(edit_start, pattern=r'^task_edit:\d+$'),
             CommandHandler('add', add_start),
             MessageHandler(filters.Regex('^📝 Новая задача$'), add_start),
         ],
         states={
+            EDIT_CHOICE: [CallbackQueryHandler(edit_field, pattern='^edit_field:(message|peer|schedule)$')],
+            EDIT_MESSAGE: [MessageHandler(text_no_cmd, edit_message)],
+            EDIT_PEER: [MessageHandler(text_no_cmd, edit_peer)],
+            WAIT_MONTH_DAYS: [
+                CallbackQueryHandler(toggle_month_day, pattern=r'^month_day:\d+$'),
+                CallbackQueryHandler(month_days_done, pattern='^month_done$'),
+            ],
+            ConversationHandler.TIMEOUT: [TypeHandler(Update, conversation_timeout)],
             WAIT_MESSAGE:      [MessageHandler(text_no_cmd, add_message)],
             WAIT_PEER_ID:      [MessageHandler(text_no_cmd, add_peer_id)],
             WAIT_DATETIME:     [MessageHandler(text_no_cmd, add_datetime)],
@@ -624,6 +791,8 @@ def main():
             ],
         },
         fallbacks=[
+            CallbackQueryHandler(edit_cancel, pattern='^edit_cancel$'),
+            CommandHandler('cancel', cancel_conv),
             CommandHandler('start', start),
             MessageHandler(cancel_filter, cancel_conv),
         ],
@@ -631,8 +800,8 @@ def main():
         conversation_timeout=300,
     )
 
-    tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(add_conv)
+    tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(CommandHandler('list',   list_tasks))
     tg_app.add_handler(CommandHandler('delete', delete_task))
     tg_app.add_handler(CommandHandler('pause',  pause_task))
