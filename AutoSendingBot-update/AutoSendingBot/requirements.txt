@@ -1,4 +1,0 @@
-python-telegram-bot[webhooks,job-queue]==21.3
-apscheduler==3.10.4
-vk-api==11.9.9
-
